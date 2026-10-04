@@ -1,6 +1,6 @@
 
 import { vec3, mat4, Fn } from '../tsl/TSLBase.js';
-import { OnAfterObjectUpdate, OnBeforeFrameUpdate } from '../utils/EventNode.js';
+import { OnAfterObjectUpdate, OnBeforeFrameUpdate, OnBeforeObjectUpdate } from '../utils/EventNode.js';
 import { normalLocal, transformNormal } from './Normal.js';
 import { positionLocal, positionPrevious } from './Position.js';
 import { varyingProperty } from '../core/PropertyNode.js';
@@ -11,11 +11,120 @@ import { instanceIndex } from '../core/IndexNode.js';
 
 import { InstancedInterleavedBuffer } from '../../core/InstancedInterleavedBuffer.js';
 import { InstancedBufferAttribute } from '../../core/InstancedBufferAttribute.js';
+import { InterleavedBufferAttribute } from '../../core/InterleavedBufferAttribute.js';
+import { getDataFromObject } from '../core/NodeUtils.js';
 import { DynamicDrawUsage } from '../../constants.js';
 
 const _matrixBuffers = /*@__PURE__*/ new WeakMap();
 const _colorBuffers = /*@__PURE__*/ new WeakMap();
 const _previousInstanceMatrices = /*@__PURE__*/ new WeakMap();
+
+/**
+ * Returns `true` if the instanced mesh can share its node builder state with
+ * other instanced meshes. Shared programs read the instance matrices of the
+ * object being rendered instead of embedding the buffers of a specific mesh.
+ * Storage buffers, instance colors and previous-frame data for motion vectors
+ * remain per object.
+ *
+ * @param {InstancedMesh} object - The instanced mesh.
+ * @param {Renderer} renderer - The renderer.
+ * @returns {boolean} Whether the instancing setup can be shared.
+ */
+export function isSharedInstancing( object, renderer ) {
+
+	if ( object.isInstancedMesh !== true || object.instanceColor !== null ) return false;
+
+	const instanceMatrix = object.instanceMatrix;
+
+	if ( ! instanceMatrix || instanceMatrix.isInstancedBufferAttribute !== true || instanceMatrix.isStorageInstancedBufferAttribute === true ) return false;
+
+	const mrt = renderer.getMRT();
+
+	return ! ( mrt && mrt.has( 'velocity' ) ) && getDataFromObject( object ).useVelocity !== true;
+
+}
+
+/**
+ * Returns the interleaved buffer that feeds the instance matrix attributes.
+ *
+ * @param {InstancedBufferAttribute} instanceMatrix - The matrix buffer attribute.
+ * @returns {InstancedInterleavedBuffer} The interleaved buffer.
+ */
+function getInterleavedMatrix( instanceMatrix ) {
+
+	let interleaved = _matrixBuffers.get( instanceMatrix );
+
+	if ( ! interleaved ) {
+
+		interleaved = new InstancedInterleavedBuffer( instanceMatrix.array, 16, 1 );
+		_matrixBuffers.set( instanceMatrix, interleaved );
+
+	}
+
+	return interleaved;
+
+}
+
+/**
+ * Copies pending matrix updates into the interleaved buffer used for rendering.
+ *
+ * @param {InstancedBufferAttribute} matrices - The source matrix attribute.
+ * @param {?InstancedInterleavedBuffer} interleavedMatrix - The interleaved buffer.
+ */
+function syncInterleavedMatrix( matrices, interleavedMatrix ) {
+
+	if ( interleavedMatrix !== null && interleavedMatrix.version !== matrices.version ) {
+
+		interleavedMatrix.clearUpdateRanges();
+		interleavedMatrix.updateRanges.push( ...matrices.updateRanges );
+		matrices.clearUpdateRanges(); // "matrices" as the source is never uploaded directly. clear to avoid update range accumulation
+
+		interleavedMatrix.version = matrices.version;
+
+	}
+
+}
+
+/**
+ * Creates the instance matrix node of a shared instancing setup. The matrices
+ * are always read from instanced attributes, which each render object binds
+ * to its own buffer, so the program does not depend on the instance count.
+ *
+ * @param {InstancedBufferAttribute} instanceMatrix - The matrix buffer attribute of the object being built.
+ * @returns {Node} The matrix node.
+ */
+function createSharedInstanceMatrixNode( instanceMatrix ) {
+
+	const interleaved = getInterleavedMatrix( instanceMatrix );
+
+	const columns = [ 0, 4, 8, 12 ].map( offset => {
+
+		const node = instancedBufferAttribute( interleaved, 'vec4', 16, offset );
+
+		// Each render object binds the matrices of its own mesh.
+		node.getObjectAttribute = object => {
+
+			const buffer = getInterleavedMatrix( object.instanceMatrix ).setUsage( object.instanceMatrix.usage );
+			const attribute = new InterleavedBufferAttribute( buffer, 4, offset );
+			attribute.isInstancedBufferAttribute = true;
+
+			return attribute;
+
+		};
+
+		return node;
+
+	} );
+
+	OnBeforeObjectUpdate( ( { object } ) => {
+
+		syncInterleavedMatrix( object.instanceMatrix, getInterleavedMatrix( object.instanceMatrix ) );
+
+	} );
+
+	return mat4( ...columns );
+
+}
 
 /**
  * Creates the appropriate node for instanced matrix transformations.
@@ -46,14 +155,7 @@ function createInstanceMatrixNode( builder, instanceMatrix ) {
 
 		} else {
 
-			let interleaved = _matrixBuffers.get( instanceMatrix );
-
-			if ( ! interleaved ) {
-
-				interleaved = new InstancedInterleavedBuffer( instanceMatrix.array, 16, 1 );
-				_matrixBuffers.set( instanceMatrix, interleaved );
-
-			}
+			const interleaved = getInterleavedMatrix( instanceMatrix );
 
 			const bufferFn = instanceMatrix.usage === DynamicDrawUsage ? instancedDynamicBufferAttribute : instancedBufferAttribute;
 
@@ -122,15 +224,30 @@ export const instanceColor = /*@__PURE__*/ varyingProperty( 'vec3', 'vInstanceCo
  */
 export const instance = /*@__PURE__*/ Fn( ( [ matrices, colors = null ], builder ) => {
 
+	setupInstance( builder, matrices, colors, false );
+
+}, 'void' );
+
+/**
+ * Sets up instanced transformations and colors.
+ *
+ * @private
+ * @param {NodeBuilder} builder - The current node builder.
+ * @param {InstancedBufferAttribute|StorageInstancedBufferAttribute} matrices - The instanced transformation matrices.
+ * @param {?InstancedBufferAttribute|StorageInstancedBufferAttribute} colors - The optional instanced colors.
+ * @param {boolean} shared - Whether the matrices are resolved from the rendered object, so the program can be shared.
+ */
+function setupInstance( builder, matrices, colors, shared ) {
+
 	const isStorageMatrix = matrices.isStorageInstancedBufferAttribute === true;
 	const isStorageColor = colors && colors.isStorageInstancedBufferAttribute === true;
 
-	const instanceMatrixNode = createInstanceMatrixNode( builder, matrices );
+	const instanceMatrixNode = shared ? createSharedInstanceMatrixNode( matrices ) : createInstanceMatrixNode( builder, matrices );
 
 	// interleaved buffer tracking for matrix
 	let interleavedMatrix = null;
 
-	if ( ! isStorageMatrix ) {
+	if ( ! isStorageMatrix && ! shared ) {
 
 		const uniformBufferSize = Math.max( matrices.count, 1 ) * 16 * 4;
 
@@ -177,15 +294,7 @@ export const instance = /*@__PURE__*/ Fn( ( [ matrices, colors = null ], builder
 
 		OnBeforeFrameUpdate( () => {
 
-			if ( interleavedMatrix !== null && interleavedMatrix.version !== matrices.version ) {
-
-				interleavedMatrix.clearUpdateRanges();
-				interleavedMatrix.updateRanges.push( ...matrices.updateRanges );
-				matrices.clearUpdateRanges(); // "matrices" as the source is never uploaded directly. clear to avoid update range accumulation
-
-				interleavedMatrix.version = matrices.version;
-
-			}
+			syncInterleavedMatrix( matrices, interleavedMatrix );
 
 			if ( colors && interleavedColor !== null && interleavedColor.version !== colors.version ) {
 
@@ -247,7 +356,7 @@ export const instance = /*@__PURE__*/ Fn( ( [ matrices, colors = null ], builder
 
 	}
 
-}, 'void' );
+}
 
 /**
  * TSL wrapper for applying instanced mesh rendering setup.
@@ -256,10 +365,10 @@ export const instance = /*@__PURE__*/ Fn( ( [ matrices, colors = null ], builder
  * @function
  * @param {InstancedMesh} instancedMesh - The instanced mesh.
  */
-export const instancedMesh = /*@__PURE__*/ Fn( ( [ instancedMesh ] ) => {
+export const instancedMesh = /*@__PURE__*/ Fn( ( [ instancedMesh ], builder ) => {
 
 	const { instanceMatrix, instanceColor } = instancedMesh;
 
-	instance( instanceMatrix, instanceColor );
+	setupInstance( builder, instanceMatrix, instanceColor, isSharedInstancing( instancedMesh, builder.renderer ) );
 
 }, 'void' );
