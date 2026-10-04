@@ -24,13 +24,17 @@ const _previousInstanceMatrices = /*@__PURE__*/ new WeakMap();
  * other instanced meshes. Shared programs read the instance matrices of the
  * object being rendered instead of embedding the buffers of a specific mesh.
  * Storage buffers, instance colors and previous-frame data for motion vectors
- * remain per object.
+ * remain per object, as does instancing outside WebGPURenderer.
  *
  * @param {InstancedMesh} object - The instanced mesh.
  * @param {Renderer} renderer - The renderer.
  * @returns {boolean} Whether the instancing setup can be shared.
  */
 export function isSharedInstancing( object, renderer ) {
+
+	// Only WebGPURenderer's render objects share node builder states; other
+	// renderers (e.g. WebGLRenderer with node materials) keep the per-object setup.
+	if ( renderer.isWebGPURenderer !== true ) return false;
 
 	if ( object.isInstancedMesh !== true || object.instanceColor !== null ) return false;
 
